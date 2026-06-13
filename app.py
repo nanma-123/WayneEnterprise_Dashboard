@@ -118,7 +118,7 @@ st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@3
     
     .story-headline {
         font-family: 'Playfair Display', serif;
-        font-size: 3.8rem;
+        font-size: 2.8rem;
         line-height: 1.1;
         margin-bottom: 5px;
         color: #111;
@@ -126,7 +126,7 @@ st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@3
     }
     .story-category {
         font-family: 'Inter', sans-serif;
-        font-size: 1.4rem;
+        font-size: 1.15rem;
         color: #be1e2d;
         text-transform: uppercase;
         font-weight: 900;
@@ -135,28 +135,28 @@ st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@3
     }
     .newspaper-text {
         font-family: 'Inter', sans-serif;
-        font-size: 1.5rem;
+        font-size: 1.15rem;
         font-weight: 400;
         line-height: 1.7;
         text-align: left;
-        margin-top: 50px;
+        margin-top: 30px;
         color: #334155;
         background-color: #f8fafc;
-        padding: 18px;
+        padding: 16px;
         border-left: 5px solid #be1e2d;
         border-radius: 8px;
     }
     .newspaper-text strong.lead-in {
         font-family: 'Inter', sans-serif;
         font-weight: 800;
-        font-size: 1.6rem;
+        font-size: 1.25rem;
         text-transform: uppercase;
         color: #0f172a;
     }
     .newspaper-text strong.intervention {
         font-family: 'Inter', sans-serif;
         font-weight: 700;
-        font-size: 1.3rem;
+        font-size: 1.05rem;
         color: #be1e2d;
         text-transform: uppercase;
         display: block;
@@ -166,7 +166,7 @@ st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@3
     }
     .chart-subtitle {
         font-family: 'Inter', sans-serif;
-        font-size: 1.6rem;
+        font-size: 1.25rem;
         color: #555;
         font-weight: 600;
         margin-bottom: -10px;
@@ -216,13 +216,13 @@ def apply_plotly_theme(fig):
     fig.update_layout(
         plot_bgcolor='rgba(0,0,0,0)',
         paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(family="Inter, sans-serif", size=22, color="#333"),
+        font=dict(family="Inter, sans-serif", size=14, color="#333"),
         title=None, # We use custom headlines
-        legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5, font=dict(size=22)),
-        margin=dict(l=10, r=10, t=20, b=40),
-        hoverlabel=dict(bgcolor="white", font_size=22, font_family="Inter"),
-        xaxis=dict(automargin=True, title_font=dict(size=22), tickfont=dict(size=20), showgrid=True, gridwidth=1, gridcolor='#e5e7eb', zeroline=False),
-        yaxis=dict(automargin=True, title_font=dict(size=22), tickfont=dict(size=20), showgrid=True, gridwidth=1, gridcolor='#e5e7eb', zeroline=False)
+        legend=dict(orientation="h", yanchor="bottom", y=-0.35, xanchor="center", x=0.5, font=dict(size=13)),
+        margin=dict(l=10, r=10, t=20, b=60),
+        hoverlabel=dict(bgcolor="white", font_size=14, font_family="Inter"),
+        xaxis=dict(automargin=True, title_font=dict(size=14), tickfont=dict(size=12), showgrid=True, gridwidth=1, gridcolor='#e5e7eb', zeroline=False),
+        yaxis=dict(automargin=True, title_font=dict(size=14), tickfont=dict(size=12), showgrid=True, gridwidth=1, gridcolor='#e5e7eb', zeroline=False)
     )
     fig.layout.title.text = ""
     return fig
