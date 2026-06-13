@@ -3,9 +3,241 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from data_processing import get_all_metrics
+import os
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from lifelines import CoxPHFitter
+from scipy.optimize import linprog
 
-# --- Configuration & Styling ---
+# ==========================================
+# DATA PROCESSING ENGINE
+# ==========================================
+DATA_DIR = os.path.join(os.path.dirname(__file__), 'docm')
+
+def load_data():
+    files = {
+        'finance': 'wayne_financial_data.csv',
+        'hr': 'wayne_hr_analytics.csv',
+        'rd': 'wayne_rd_portfolio.csv',
+        'security': 'wayne_security_data.csv',
+        'supply': 'wayne_supply_chain.csv'
+    }
+    data = {}
+    for key, filename in files.items():
+        data[key] = pd.read_csv(os.path.join(DATA_DIR, filename))
+    return data
+
+def process_phase1(data):
+    df_fin = data['finance'].copy()
+    df_hr = data['hr'].copy()
+    df_sec = data['security'].copy()
+    df_sup = data['supply'].copy()
+
+    rd_rev_corr = {}
+    for div in df_fin['Division'].unique():
+        df_div = df_fin[df_fin['Division'] == div].sort_values(['Year', 'Quarter'])
+        rd = df_div['RD_Investment_M'].values
+        rev = df_div['Revenue_M'].values
+        if len(rd) > 2:
+            corrs = []
+            for lag in range(3):
+                if lag == 0:
+                    corrs.append(np.corrcoef(rd, rev)[0, 1])
+                else:
+                    corrs.append(np.corrcoef(rd[:-lag], rev[lag:])[0, 1])
+            rd_rev_corr[div] = corrs
+    
+    sec_model = LinearRegression()
+    X_sec = df_sec[['Community_Engagement_Events', 'Wayne_Tech_Deployments']]
+    y_sec = df_sec['Security_Incidents']
+    sec_model.fit(X_sec, y_sec)
+    sec_impact = {
+        'Community_Engagement_Coef': sec_model.coef_[0],
+        'Tech_Deployments_Coef': sec_model.coef_[1]
+    }
+
+    df_hr['Date'] = pd.to_datetime(df_hr['Date'])
+    df_hr['Year'] = df_hr['Date'].dt.year
+    df_hr['Quarter'] = 'Q' + df_hr['Date'].dt.quarter.astype(str)
+    hr_agg = df_hr.groupby(['Department', 'Year', 'Quarter'])['Employee_Satisfaction_Score'].mean().reset_index()
+    
+    df_fin_prod = df_fin.copy()
+    df_fin_prod['Productivity'] = df_fin_prod['Revenue_M'] / (df_fin_prod['Employee_Count'] + 1e-5)
+    
+    hr_prod_merged = pd.merge(df_fin_prod, hr_agg, left_on=['Division', 'Year', 'Quarter'], right_on=['Department', 'Year', 'Quarter'], how='inner')
+    satisfaction_productivity_corr = hr_prod_merged['Employee_Satisfaction_Score'].corr(hr_prod_merged['Productivity'])
+
+    features = ['Lead_Time_Days', 'Inventory_Turnover', 'Supply_Chain_Disruptions']
+    X_sup = df_sup[features].fillna(0)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_sup)
+    
+    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+    df_sup['Efficiency_Cluster'] = kmeans.fit_predict(X_scaled)
+    
+    cluster_analysis = df_sup.groupby('Efficiency_Cluster').agg({
+        'Lead_Time_Days': 'mean',
+        'Inventory_Turnover': 'mean',
+        'Supply_Chain_Disruptions': 'mean',
+        'Quality_Score_Pct': 'mean'
+    }).reset_index()
+
+    return {
+        'rd_rev_corr': rd_rev_corr,
+        'sec_impact': sec_impact,
+        'hr_prod_merged': hr_prod_merged,
+        'satisfaction_productivity_corr': satisfaction_productivity_corr,
+        'cluster_analysis': cluster_analysis,
+        'df_sup_clustered': df_sup
+    }
+
+def process_phase2(data):
+    df_sec = data['security'].copy()
+    df_rd = data['rd'].copy()
+    df_hr = data['hr'].copy()
+    df_sup = data['supply'].copy()
+
+    df_sec['Date'] = pd.to_datetime(df_sec['Date'])
+    df_sec = df_sec.sort_values('Date')
+    df_sec_encoded = pd.get_dummies(df_sec, columns=['District'])
+    df_sec_encoded['Incidents_Lag1'] = df_sec_encoded.groupby('District_Downtown')['Security_Incidents'].shift(1).fillna(df_sec_encoded['Security_Incidents'].mean())
+    
+    features = [c for c in df_sec_encoded.columns if c.startswith('District_')] + ['Wayne_Tech_Deployments', 'Community_Engagement_Events', 'Incidents_Lag1']
+    X_rf = df_sec_encoded[features]
+    y_rf = df_sec_encoded['Security_Incidents']
+    rf_sec = RandomForestRegressor(random_state=42)
+    rf_sec.fit(X_rf, y_rf)
+    
+    next_X = X_rf.iloc[-len(df_sec['District'].unique()):].copy()
+    next_X['Wayne_Tech_Deployments'] += 10
+    sec_forecast = rf_sec.predict(next_X)
+
+    df_rd['Burn_Rate'] = df_rd['Budget_Spent_M'] / df_rd['Budget_Allocated_M']
+    df_rd_train = df_rd[df_rd['Status'].isin(['Completed', 'Paused'])].copy()
+    df_rd_active = df_rd[df_rd['Status'] == 'Active'].copy()
+    
+    project_preds = None
+    if len(df_rd_train) > 0 and 'Paused' in df_rd_train['Status'].values and 'Completed' in df_rd_train['Status'].values:
+        y_train = (df_rd_train['Status'] == 'Completed').astype(int)
+        X_train = df_rd_train[['Burn_Rate', 'Timeline_Adherence_Pct']]
+        
+        clf = RandomForestClassifier(random_state=42)
+        clf.fit(X_train, y_train)
+        
+        X_active = df_rd_active[['Burn_Rate', 'Timeline_Adherence_Pct']].fillna(0)
+        df_rd_active['Success_Probability'] = clf.predict_proba(X_active)[:, 1]
+        project_preds = df_rd_active[['Project_Name', 'Success_Probability']]
+
+    df_hr['Date'] = pd.to_datetime(df_hr['Date'])
+    df_hr = df_hr.sort_values(['Department', 'Employee_Level', 'Date'])
+    df_hr['Retention_Delta'] = df_hr.groupby(['Department', 'Employee_Level'])['Retention_Rate_Pct'].diff()
+    
+    df_hr['Month_Idx'] = df_hr.groupby(['Department', 'Employee_Level']).cumcount() + 1
+    df_hr['Churn_Event'] = (df_hr['Retention_Delta'] < -1.0).astype(int)
+    
+    surv_df = df_hr.dropna(subset=['Salary_Band', 'Benefits_Utilization_Pct', 'Training_Hours_Annual', 'Retention_Delta']).copy()
+    surv_df['Salary_Band_Num'] = LabelEncoder().fit_transform(surv_df['Salary_Band'])
+    
+    cph = CoxPHFitter()
+    cph_data = surv_df[['Month_Idx', 'Churn_Event', 'Benefits_Utilization_Pct', 'Training_Hours_Annual', 'Employee_Satisfaction_Score']]
+    try:
+        cph.fit(cph_data, duration_col='Month_Idx', event_col='Churn_Event')
+        hr_hazard = cph.summary[['exp(coef)', 'p']]
+    except Exception:
+        hr_hazard = None
+
+    prob_disruption = (df_sup['Supply_Chain_Disruptions'] > 0).mean()
+    avg_cost = df_sup['Cost_Per_Unit'].mean()
+    avg_vol = df_sup['Monthly_Production_Volume'].mean()
+    
+    simulations = 1000
+    mc_results = []
+    np.random.seed(42)
+    for _ in range(simulations):
+        disruptions = np.random.binomial(1, prob_disruption, 12)
+        sim_cost = avg_cost * (1 + 0.15 * disruptions)
+        sim_vol = avg_vol * (1 - 0.20 * disruptions)
+        mc_results.append({
+            'Total_Vol': sim_vol.sum(),
+            'Avg_Cost': sim_cost.mean()
+        })
+    df_mc = pd.DataFrame(mc_results)
+
+    return {
+        'sec_forecast': sec_forecast,
+        'project_preds': project_preds,
+        'hr_hazard': hr_hazard,
+        'mc_results': df_mc
+    }
+
+def process_phase3(data):
+    df_fin = data['finance'].copy()
+    df_rd = data['rd'].copy()
+    df_hr = data['hr'].copy()
+    df_sec = data['security'].copy()
+    df_sup = data['supply'].copy()
+
+    fin_agg = df_fin.groupby('Division')['Net_Profit_M'].mean().reset_index()
+    hr_agg = df_hr.groupby('Department')['Employee_Satisfaction_Score'].mean().reset_index()
+    bench_df = pd.merge(fin_agg, hr_agg, left_on='Division', right_on='Department', how='left')
+    
+    scaler = StandardScaler()
+    bench_df['Fin_Norm'] = scaler.fit_transform(bench_df[['Net_Profit_M']])
+    bench_df['HR_Norm'] = scaler.fit_transform(bench_df[['Employee_Satisfaction_Score']].fillna(0))
+    bench_df['Composite_Score'] = (0.4 * bench_df['Fin_Norm'] + 0.3 * bench_df['HR_Norm'] + 0.3 * np.random.rand(len(bench_df)))
+
+    divs = bench_df['Division'].values
+    avg_profits = df_fin.groupby('Division')['Net_Profit_M'].mean().values
+    avg_costs = df_fin.groupby('Division')['Operating_Costs_M'].mean().values
+    
+    c = -avg_profits
+    A_ub = [avg_costs] 
+    b_ub = [avg_costs.sum() * 1.05] 
+    bounds = [(0.8, 1.2) for _ in divs] 
+    
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    allocations = res.x if res.success else np.ones(len(divs))
+
+    lp_res = pd.DataFrame({
+        'Division': divs,
+        'Optimal_Multiplier': allocations,
+        'Current_Avg_Cost': avg_costs,
+        'Proposed_Cost': avg_costs * allocations
+    })
+
+    innovation_data = df_rd[['Project_Name', 'Division', 'Patent_Applications', 'Budget_Spent_M', 'Status']]
+
+    cf = df_sup['Carbon_Footprint_MT'].mean()
+    div_idx = df_hr['Diversity_Index'].mean()
+    comm = df_sec['Community_Engagement_Events'].mean()
+    
+    esg = {
+        'Carbon_Footprint': cf,
+        'Diversity_Index': div_idx,
+        'Community_Events': comm,
+        'Composite_ESG': (div_idx * 50) + (comm * 2) - (cf / 100) 
+    }
+
+    return {
+        'benchmarking': bench_df,
+        'resource_allocation': lp_res,
+        'innovation_data': innovation_data,
+        'esg': esg
+    }
+
+@st.cache_data
+def get_all_metrics():
+    data = load_data()
+    p1 = process_phase1(data)
+    p2 = process_phase2(data)
+    p3 = process_phase3(data)
+    return data, p1, p2, p3
+
+# ==========================================
+# STREAMLIT UI & STYLING
+# ==========================================
 st.set_page_config(page_title="Wayne Enterprises Dashboard", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;900&family=Playfair+Display:wght@400;600;700;900&display=swap" rel="stylesheet"><style>
@@ -18,21 +250,20 @@ st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@3
     .metric-title { font-size: 1.05rem; color: #64748b; font-weight: 600; margin-bottom: 8px; text-transform: uppercase; }
     .metric-value { font-size: 2.6rem; font-weight: 700; color: #0f172a; margin: 0; }
     
-    /* Highlighted Tab Navigation Bar */
     .stTabs [data-baseweb="tab-list"] { 
-        gap: 16px; 
+        gap: 20px; 
         justify-content: center; 
         margin-top: 50px; 
         margin-bottom: 40px; 
         background-color: #f1f5f9; 
-        padding: 18px; 
-        border-radius: 16px; 
+        padding: 24px 32px; 
+        border-radius: 20px; 
         box-shadow: inset 0 2px 4px rgba(0,0,0,0.02);
     }
     .stTabs [data-baseweb="tab"] { 
         background-color: transparent !important; 
-        border-radius: 12px !important; 
-        padding: 15px 45px; 
+        border-radius: 16px !important; 
+        padding: 20px 60px; 
         transition: all 0.3s ease-in-out;
         height: auto;
         border: none !important;
@@ -46,7 +277,7 @@ st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@3
     }
     .stTabs [data-baseweb="tab"] p {
         font-weight: 800 !important; 
-        font-size: 1.8rem !important; 
+        font-size: 2.2rem !important; 
         color: #64748b !important; 
         margin: 0;
         transition: color 0.3s ease-in-out;
@@ -67,7 +298,6 @@ st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@3
         background-color: transparent !important;
     }
 
-    /* Newspaper specific CSS for the analysis section */
     .newspaper-sub-header {
         text-align: center;
         font-family: 'Inter', sans-serif;
@@ -118,7 +348,7 @@ st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@3
     
     .story-headline {
         font-family: 'Playfair Display', serif;
-        font-size: 2.4rem;
+        font-size: 3.8rem;
         line-height: 1.1;
         margin-bottom: 5px;
         color: #111;
@@ -126,7 +356,7 @@ st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@3
     }
     .story-category {
         font-family: 'Inter', sans-serif;
-        font-size: 0.85rem;
+        font-size: 1.4rem;
         color: #be1e2d;
         text-transform: uppercase;
         font-weight: 900;
@@ -134,33 +364,39 @@ st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@3
         letter-spacing: 1px;
     }
     .newspaper-text {
-        font-family: 'Playfair Display', serif;
-        font-size: 1.15rem;
-        line-height: 1.5;
-        text-align: justify;
-        margin-top: 15px;
-        color: #222;
+        font-family: 'Inter', sans-serif;
+        font-size: 1.5rem;
+        font-weight: 400;
+        line-height: 1.7;
+        text-align: left;
+        margin-top: 50px;
+        color: #334155;
+        background-color: #f8fafc;
+        padding: 18px;
+        border-left: 5px solid #be1e2d;
+        border-radius: 8px;
     }
     .newspaper-text strong.lead-in {
         font-family: 'Inter', sans-serif;
-        font-weight: 900;
-        font-size: 1.15rem;
+        font-weight: 800;
+        font-size: 1.6rem;
         text-transform: uppercase;
+        color: #0f172a;
     }
     .newspaper-text strong.intervention {
         font-family: 'Inter', sans-serif;
         font-weight: 700;
-        font-size: 0.95rem;
+        font-size: 1.3rem;
         color: #be1e2d;
         text-transform: uppercase;
         display: block;
-        margin-top: 15px;
-        border-top: 1px dashed #ccc;
-        padding-top: 8px;
+        margin-top: 12px;
+        border-top: 1px solid #e2e8f0;
+        padding-top: 12px;
     }
     .chart-subtitle {
         font-family: 'Inter', sans-serif;
-        font-size: 0.85rem;
+        font-size: 1.6rem;
         color: #555;
         font-weight: 600;
         margin-bottom: -10px;
@@ -210,13 +446,13 @@ def apply_plotly_theme(fig):
     fig.update_layout(
         plot_bgcolor='rgba(0,0,0,0)',
         paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(family="Inter, sans-serif", size=11, color="#333"),
-        title=None, # We use custom headlines
-        legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5, font=dict(size=11)),
-        margin=dict(l=10, r=10, t=20, b=20),
-        hoverlabel=dict(bgcolor="white", font_size=13, font_family="Inter"),
-        xaxis=dict(automargin=True, title_font=dict(size=12), showgrid=True, gridwidth=1, gridcolor='#e5e7eb', zeroline=False),
-        yaxis=dict(automargin=True, title_font=dict(size=12), showgrid=True, gridwidth=1, gridcolor='#e5e7eb', zeroline=False)
+        font=dict(family="Inter, sans-serif", size=22, color="#333"),
+        title=None,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5, font=dict(size=22)),
+        margin=dict(l=10, r=10, t=20, b=40),
+        hoverlabel=dict(bgcolor="white", font_size=22, font_family="Inter"),
+        xaxis=dict(automargin=True, title_font=dict(size=22), tickfont=dict(size=20), showgrid=True, gridwidth=1, gridcolor='#e5e7eb', zeroline=False),
+        yaxis=dict(automargin=True, title_font=dict(size=22), tickfont=dict(size=20), showgrid=True, gridwidth=1, gridcolor='#e5e7eb', zeroline=False)
     )
     fig.layout.title.text = ""
     return fig
@@ -252,15 +488,10 @@ def render_story_text(insight, intervention_text=None):
 def render_big_number(number, subtitle=""):
     st.markdown(f'<div class="big-number">{number}<span class="big-number-sub">{subtitle}</span></div>', unsafe_allow_html=True)
 
-
 # --- Data Loading ---
-@st.cache_data
-def load_and_process_data():
-    return get_all_metrics()
-
 try:
     with st.spinner("Loading Wayne Analytics Engine..."):
-        data, p1, p2, p3 = load_and_process_data()
+        data, p1, p2, p3 = get_all_metrics()
 except Exception as e:
     st.error(f"Error loading data: {e}")
     st.stop()
@@ -269,13 +500,13 @@ VIBRANT_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ef4444', '#06b6d
 MINT_COLORS = ['#274e13', '#6aa84f', '#bf9000', '#cc0000', '#0b5394', '#674ea7']
 
 # ==========================================
-# REPORT HEADER (ORIGINAL WAYNE STYLE)
+# REPORT HEADER
 # ==========================================
 st.markdown("<div style='display: flex; justify-content: center; align-items: center; margin-top: 20px;'><div style='background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: white; width: 75px; height: 75px; display: flex; justify-content: center; align-items: center; border-radius: 16px; margin-right: 24px; font-family: \"Playfair Display\", serif; font-size: 3.8rem; font-weight: 800; box-shadow: 0 6px 12px rgba(0,0,0,0.15); line-height: 1;'>W</div><h1 style='color: #0f172a; font-size: 4.0rem; margin: 0;'>Wayne Enterprises</h1></div>", unsafe_allow_html=True)
 st.markdown("<p style='text-align: center; color: #64748b; font-size: 1.4rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 50px;'>Executive Analytics & Strategic Interventions Report</p>", unsafe_allow_html=True)
 
 # ==========================================
-# EXECUTIVE OVERVIEW (Always Visible)
+# EXECUTIVE OVERVIEW
 # ==========================================
 esg = p3['esg']
 col1, col2, col3, col4 = st.columns(4)
@@ -293,84 +524,83 @@ tab_diag, tab_pred, tab_strat = st.tabs(["Diagnostics", "Predictive Analytics", 
 
 # --- TAB 1: Diagnostics ---
 with tab_diag:
-    st.markdown('<div class="newspaper-sub-header">PLAIN FACTS</div>', unsafe_allow_html=True)
-    st.markdown("""
-    <div style="text-align: center; margin-bottom: 10px;">
-        <span class="in-charts-badge">IN CHARTS</span>
-        <span class="deep-dive-title">DIAGNOSTICS DEEP DIVE</span>
-    </div>
-    """, unsafe_allow_html=True)
     st.markdown("<hr class='horizontal-rule'>", unsafe_allow_html=True)
     
-    # ROW 1: Financial Trajectory & Innovation Economics
+    # ROW 1: Revenue & Profit
     c1, c2 = st.columns(2)
     with c1:
         st.markdown('<div class="vertical-rule">', unsafe_allow_html=True)
-        render_headline("Broad-Based Uptick", "Financial Trajectory")
-        render_chart_subtitle("Revenue by Division Over Time ($M)")
-        df_fin = data['finance']
-        fig_fin = px.area(df_fin, x=df_fin.index, y='Revenue_M', color='Division', color_discrete_sequence=MINT_COLORS)
-        fig_fin.update_traces(line=dict(width=2))
-        st.plotly_chart(apply_plotly_theme(fig_fin), use_container_width=True)
+        render_headline("Top Line Drivers", "Financial Operations")
+        render_chart_subtitle("Sum of Revenue by Division ($M)")
+        df_fin_agg = data['finance'].groupby('Division')['Revenue_M'].sum().reset_index()
+        df_fin_agg = df_fin_agg.sort_values('Revenue_M', ascending=True)
+        fig_rev = px.funnel(df_fin_agg, y='Division', x='Revenue_M', color='Division', color_discrete_sequence=MINT_COLORS)
+        st.plotly_chart(apply_plotly_theme(fig_rev), use_container_width=True, config={'displayModeBar': True, 'displaylogo': False, 'modeBarButtonsToRemove': ['lasso2d', 'select2d']})
         render_story_text(
-            "REVENUE CONTINUES its upward trajectory across all major divisions. Our financial data reveals sustained, compounding growth, particularly within Wayne Aerospace and Construction. Historical trends demonstrate high resilience to broader economic downturns, driven by our diversified portfolio.",
-            "Maintain aggressive capital deployment in Aerospace. Evaluate Wayne Foundation's cash burn rate to ensure sustainability without compromising our philanthropic mission."
+            "THE FUNNEL CHART illustrates Wayne Construction and Aerospace dominate top-line revenue. An analysis of cumulative revenue across divisions shows that infrastructure and defense contracts heavily outweigh biotechnology and applied sciences in absolute dollar terms.",
+            "Double down on scalable infrastructure projects while exploring high-margin pivot opportunities for Biotech."
         )
         st.markdown('</div>', unsafe_allow_html=True)
 
     with c2:
         st.markdown('<div class="col-padding-left">', unsafe_allow_html=True)
-        render_headline("Growth Gaps", "Innovation Economics")
-        render_chart_subtitle("Correlation Strength by Lag Time")
-        rd_rev = p1['rd_rev_corr']
-        df_corr = pd.DataFrame(rd_rev, index=['0 Lag', '1 Qtr Lag', '2 Qtr Lag']).T
-        fig_rd = px.bar(df_corr, barmode='group', color_discrete_sequence=['#9ca3af', '#6b7280', '#1f2937'])
-        st.plotly_chart(apply_plotly_theme(fig_rd), use_container_width=True)
+        render_headline("Bottom Line Realities", "Profitability")
+        render_chart_subtitle("Sum of Net Profit by Division ($M)")
+        df_prof_agg = data['finance'].groupby('Division')['Net_Profit_M'].sum().reset_index()
+        df_prof_agg = df_prof_agg.sort_values('Net_Profit_M', ascending=False)
+        fig_prof = go.Figure(go.Waterfall(
+            name="Profit", orientation="v",
+            measure=["relative"] * len(df_prof_agg),
+            x=df_prof_agg['Division'],
+            y=df_prof_agg['Net_Profit_M'],
+            textposition="outside",
+            text=[f"${v:,.0f}M" for v in df_prof_agg['Net_Profit_M']],
+            decreasing={"marker":{"color":MINT_COLORS[3]}},
+            increasing={"marker":{"color":MINT_COLORS[0]}},
+            totals={"marker":{"color":MINT_COLORS[4]}}
+        ))
+        st.plotly_chart(apply_plotly_theme(fig_prof), use_container_width=True, config={'displayModeBar': True, 'displaylogo': False, 'modeBarButtonsToRemove': ['lasso2d', 'select2d']})
         render_story_text(
-            "R&D INVESTMENT yields maximum revenue impact after two quarters. By analyzing time-lagged cross-correlations, we discovered that capital injected into R&D doesn't immediately reflect in revenue. Instead, the strongest correlation emerges exactly six months after the initial spend.",
-            "Restructure milestone funding. Do not penalize R&D project managers for flat revenue in the immediate quarter following a budget increase."
+            "THE WATERFALL CHART breaks down net profit margins, revealing where the true enterprise value lies. Even though some divisions show massive revenue, operating costs significantly reduce their net contribution. Wayne Foundation operates at a slight deficit, while Wayne Construction remains the most profitable engine.",
+            "Investigate cost overruns in applied sciences to bring profit margins closer to the corporate average."
         )
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("<hr class='horizontal-rule'>", unsafe_allow_html=True)
 
-    # ROW 2: Corporate Security & Supply Chain Clusters
+    # ROW 2: R&D Budget & Supply Chain Carbon
     c3, c4 = st.columns(2)
     with c3:
         st.markdown('<div class="vertical-rule">', unsafe_allow_html=True)
-        render_headline("Silver Lining", "Corporate Security")
-        sec_imp = p1['sec_impact']
-        
-        render_big_number(f"{abs(sec_imp['Tech_Deployments_Coef']):.1f}", "x")
-        
+        render_headline("Capital Burn", "R&D Economics")
+        render_chart_subtitle("Budget Allocated vs Spent by Division ($M)")
+        df_rd_agg = data['rd'].groupby('Division')[['Budget_Allocated_M', 'Budget_Spent_M']].sum().reset_index()
+        fig_rd = px.scatter(df_rd_agg, x='Budget_Allocated_M', y='Budget_Spent_M', size='Budget_Allocated_M', color='Division', text='Division', size_max=40, color_discrete_sequence=MINT_COLORS)
+        fig_rd.update_traces(textposition='top center')
+        fig_rd.add_shape(type="line", line=dict(dash='dash', color='gray'), x0=0, y0=0, x1=df_rd_agg['Budget_Allocated_M'].max()*1.1, y1=df_rd_agg['Budget_Allocated_M'].max()*1.1)
+        st.plotly_chart(apply_plotly_theme(fig_rd), use_container_width=True, config={'displayModeBar': True, 'displaylogo': False, 'modeBarButtonsToRemove': ['lasso2d', 'select2d']})
         render_story_text(
-            f"WAYNE TECH significantly outperforms philanthropy in direct crime reduction. Multivariate regression isolates the exact impact of our interventions. For every additional Tech Deployment, security incidents drop by a factor of {abs(sec_imp['Tech_Deployments_Coef']):.2f}. Community events also help (dropping incidents by {abs(sec_imp['Community_Engagement_Coef']):.2f}), but technological hardware is mathematically superior.",
-            "Shift 30% of the philanthropic community budget directly into hardware and software Wayne Tech deployments in high-risk districts like The Narrows."
+            "THIS SCATTER PLOT maps actual budget spent against allocated capital. The dashed reference line represents 100% utilization. Divisions falling far below the line show a massive gap between allocated capital and actual deployed capital, suggesting bottlenecks in pipeline execution.",
+            "Reallocate stagnant capital from under-spending divisions to high-velocity projects in Aerospace."
         )
         st.markdown('</div>', unsafe_allow_html=True)
 
     with c4:
         st.markdown('<div class="col-padding-left">', unsafe_allow_html=True)
-        render_headline("Role Reversal", "Supply Chain Efficiency")
-        render_chart_subtitle("Quality Score Distribution by Cluster")
-        df_sup = p1['df_sup_clustered']
-        fig_sup = px.box(df_sup, x='Efficiency_Cluster', y='Quality_Score_Pct', color='Efficiency_Cluster', color_discrete_sequence=MINT_COLORS)
-        st.plotly_chart(apply_plotly_theme(fig_sup), use_container_width=True)
+        render_headline("Environmental Toll", "Supply Chain ESG")
+        render_chart_subtitle("Average Carbon Footprint by Facility Location (MT)")
+        df_sup_agg = data['supply'].groupby('Facility_Location')['Carbon_Footprint_MT'].mean().reset_index()
+        df_sup_agg = df_sup_agg.sort_values('Carbon_Footprint_MT', ascending=True)
+        fig_cf = px.bar(df_sup_agg, x='Carbon_Footprint_MT', y='Facility_Location', orientation='h', color='Facility_Location', color_discrete_sequence=MINT_COLORS)
+        st.plotly_chart(apply_plotly_theme(fig_cf), use_container_width=True, config={'displayModeBar': True, 'displaylogo': False, 'modeBarButtonsToRemove': ['lasso2d', 'select2d']})
         render_story_text(
-            "OPERATIONAL DISPARITIES were exposed across facilities using K-Means Clustering. Our machine learning algorithm grouped facilities into distinct efficiency tiers based on lead times and disruption rates. The data overwhelmingly proves that facilities in the top 'Efficiency Cluster' produce significantly higher quality output.",
-            "Implement a 'Metropolis Standard' protocol. Mandate underperforming facilities to adopt the logistical routing software used exclusively by top-tier facilities."
+            "THE BAR CHART visually weights the environmental impact. The large geographic block for Star City facilities highlights severe inefficiencies in our manufacturing hubs compared to smaller contributors like Keystone City.",
+            "Accelerate the rollout of green-energy retrofits specifically targeting Star City manufacturing centers."
         )
         st.markdown('</div>', unsafe_allow_html=True)
 
 # --- TAB 2: Predictive Analytics ---
 with tab_pred:
-    st.markdown('<div class="newspaper-sub-header">PLAIN FACTS</div>', unsafe_allow_html=True)
-    st.markdown("""
-    <div style="text-align: center; margin-bottom: 10px;">
-        <span class="in-charts-badge">IN CHARTS</span>
-        <span class="deep-dive-title">PREDICTIVE DEEP DIVE</span>
-    </div>
-    """, unsafe_allow_html=True)
     st.markdown("<hr class='horizontal-rule'>", unsafe_allow_html=True)
 
     # ROW 3: Threat Forecasting & Innovation Probabilities
@@ -384,7 +614,7 @@ with tab_pred:
         df_f = pd.DataFrame({'District': districts, 'Forecasted_Incidents': sec_f})
         fig_f = px.bar(df_f, x='District', y='Forecasted_Incidents', color='District', color_discrete_sequence=MINT_COLORS)
         fig_f.update_layout(xaxis=dict(tickangle=-45)) 
-        st.plotly_chart(apply_plotly_theme(fig_f), use_container_width=True)
+        st.plotly_chart(apply_plotly_theme(fig_f), use_container_width=True, config={'displayModeBar': True, 'displaylogo': False, 'modeBarButtonsToRemove': ['lasso2d', 'select2d']})
         render_story_text(
             "RANDOM FOREST modeling anticipates an escalation in The Narrows. Feeding historical crime data, spatial geometries, and technological deployment rates into our regressor allows us to forecast next month's incidents. The algorithm flags a persistent, high-volume threat remaining in specific urban districts.",
             "Pre-emptively stage rapid-response teams in the highest forecasted districts before the start of the next calendar month."
@@ -400,7 +630,7 @@ with tab_pred:
             top_10 = df_p.sort_values('Success_Probability', ascending=False).head(10)
             fig_p = px.bar(top_10, x='Success_Probability', y='Project_Name', orientation='h', color='Success_Probability', color_continuous_scale='Greys')
             fig_p.update_layout(yaxis={'categoryorder':'total ascending'})
-            st.plotly_chart(apply_plotly_theme(fig_p), use_container_width=True)
+            st.plotly_chart(apply_plotly_theme(fig_p), use_container_width=True, config={'displayModeBar': True, 'displaylogo': False, 'modeBarButtonsToRemove': ['lasso2d', 'select2d']})
         render_story_text(
             "MACHINE LEARNING successfully isolates top viable R&D projects. Not all R&D is created equal. Using historical completion data, we trained a classification model to output the percentage likelihood of success for currently active projects. The model penalizes bloated budgets and rewards rapid prototyping.",
             "Immediately halt funding for projects with a success probability below 30%. Reallocate capital reserves to the top projects to accelerate time-to-market."
@@ -426,7 +656,7 @@ with tab_pred:
             df_hr_haz['Feature'] = df_hr_haz['Feature'].map(name_map).fillna(df_hr_haz['Feature'])
             fig_hr = px.bar(df_hr_haz, x='Hazard_Ratio', y='Feature', orientation='h', color_discrete_sequence=['#be1e2d'])
             fig_hr.add_vline(x=1.0, line_dash="dash", line_color="black")
-            st.plotly_chart(apply_plotly_theme(fig_hr), use_container_width=True)
+            st.plotly_chart(apply_plotly_theme(fig_hr), use_container_width=True, config={'displayModeBar': True, 'displaylogo': False, 'modeBarButtonsToRemove': ['lasso2d', 'select2d']})
         render_story_text(
             "COX PROPORTIONAL hazards model decodes turnover drivers. Survival analysis isolates how specific employee benefits and training programs affect the risk of resignation. A Hazard Ratio below 1.0 indicates a reduction in attrition risk. The model proves high Employee Satisfaction is the strongest buffer.",
             "Implement targeted benefits awareness campaigns in departments with declining retention rates."
@@ -441,7 +671,7 @@ with tab_pred:
         fig_mc = px.histogram(mc, x='Avg_Cost', nbins=40, color_discrete_sequence=['#4b5563'])
         fig_mc.add_vline(x=mc['Avg_Cost'].mean(), line_dash="dash", line_color="black")
         fig_mc.add_vline(x=np.percentile(mc['Avg_Cost'], 95), line_dash="solid", line_color="#be1e2d")
-        st.plotly_chart(apply_plotly_theme(fig_mc), use_container_width=True)
+        st.plotly_chart(apply_plotly_theme(fig_mc), use_container_width=True, config={'displayModeBar': True, 'displaylogo': False, 'modeBarButtonsToRemove': ['lasso2d', 'select2d']})
         render_story_text(
             "MONTE CARLO simulation exposes massive downside cost risks. By running 1,000 randomized 12-month simulations based on our historical disruption variance, we modeled the worst-case scenarios for supply chain costs. The distribution shows a long tail of catastrophic cost spikes if global logistics fail.",
             "Do not plan for the 'Average Cost'. Build cash reserves to withstand the 95th percentile cost curve to ensure uninterrupted operations during global crises."
@@ -450,13 +680,6 @@ with tab_pred:
 
 # --- TAB 3: Strategy ---
 with tab_strat:
-    st.markdown('<div class="newspaper-sub-header">PLAIN FACTS</div>', unsafe_allow_html=True)
-    st.markdown("""
-    <div style="text-align: center; margin-bottom: 10px;">
-        <span class="in-charts-badge">IN CHARTS</span>
-        <span class="deep-dive-title">STRATEGY DEEP DIVE</span>
-    </div>
-    """, unsafe_allow_html=True)
     st.markdown("<hr class='horizontal-rule'>", unsafe_allow_html=True)
 
     # ROW 5: Resource Optimization & Innovation Efficiency
@@ -466,8 +689,12 @@ with tab_strat:
         render_headline("Capital Allocation", "Resource Optimization")
         render_chart_subtitle("Linear Programming Optimization Table")
         ra = p3['resource_allocation']
-        st.markdown("""<style>[data-testid="stDataFrame"] {font-family: 'Inter', sans-serif; font-size: 1.0rem;}</style>""", unsafe_allow_html=True)
-        st.dataframe(ra.style.format({'Optimal_Multiplier': "{:.2f}", 'Current_Avg_Cost': "${:.2f}M", 'Proposed_Cost': "${:.2f}M"}), use_container_width=True)
+        st.markdown("""<style>
+        table { font-size: 1.5rem !important; font-family: 'Inter', sans-serif !important; width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px 15px !important; text-align: left; border-bottom: 1px solid #ddd; }
+        th { font-weight: bold; background-color: #f8fafc; color: #333; }
+        </style>""", unsafe_allow_html=True)
+        st.table(ra.style.format({'Optimal_Multiplier': "{:.2f}", 'Current_Avg_Cost': "${:.2f}M", 'Proposed_Cost': "${:.2f}M"}))
         render_story_text(
             "LINEAR PROGRAMMING algorithm dictates optimal capital redistribution. We ran an optimization model to maximize enterprise Net Profit, constrained by maximum operating costs and minimum safety requirements. The model explicitly tells us exactly how much to scale each division.",
             "Execute the 'Optimal Multiplier'. If a division's multiplier is 1.20, increase their operating budget by exactly 20% next quarter."
@@ -482,7 +709,7 @@ with tab_strat:
         fig_ino = px.scatter(ino, x='Budget_Spent_M', y='Patent_Applications', color='Division', hover_data=['Project_Name', 'Status'], size_max=15, color_discrete_sequence=MINT_COLORS)
         fig_ino.add_shape(type="rect", x0=ino['Budget_Spent_M'].min(), y0=ino['Patent_Applications'].median(), x1=ino['Budget_Spent_M'].median(), y1=ino['Patent_Applications'].max()*1.1, fillcolor="rgba(16, 185, 129, 0.1)", line_width=0)
         fig_ino.update_layout(xaxis_title="Budget Spent ($M)", yaxis_title="Patent Applications")
-        st.plotly_chart(apply_plotly_theme(fig_ino), use_container_width=True)
+        st.plotly_chart(apply_plotly_theme(fig_ino), use_container_width=True, config={'displayModeBar': True, 'displaylogo': False, 'modeBarButtonsToRemove': ['lasso2d', 'select2d']})
         render_story_text(
             "PLOTTING PATENT applications against Budget Spent reveals highly efficient outliers. The top-left quadrant represents teams generating massive intellectual property while burning minimal cash.",
             "Identify the project managers in the top-left quadrant and promote them to direct underperforming, high-budget projects."
