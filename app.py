@@ -118,7 +118,7 @@ st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@3
     
     .story-headline {
         font-family: 'Playfair Display', serif;
-        font-size: 2.8rem;
+        font-size: 2.2rem;
         line-height: 1.1;
         margin-bottom: 5px;
         color: #111;
@@ -126,7 +126,7 @@ st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@3
     }
     .story-category {
         font-family: 'Inter', sans-serif;
-        font-size: 1.15rem;
+        font-size: 1.0rem;
         color: #be1e2d;
         text-transform: uppercase;
         font-weight: 900;
@@ -166,7 +166,7 @@ st.markdown("""<link href="https://fonts.googleapis.com/css2?family=Inter:wght@3
     }
     .chart-subtitle {
         font-family: 'Inter', sans-serif;
-        font-size: 1.25rem;
+        font-size: 1.1rem;
         color: #555;
         font-weight: 600;
         margin-bottom: -10px;
